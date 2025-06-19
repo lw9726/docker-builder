@@ -1,0 +1,288 @@
+# .github/workflows/build.yml
+name: Build ProxyPool
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/proxypool
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Clone ProxyPool source
+      run: |
+        git clone https://github.com/ssrlive/proxypool.git
+        ls -la proxypool/
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./proxypool
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Clone ProxyPool source
+      run: |
+        git clone https://github.com/ssrlive/proxypool.git
+
+    - name: Create test config
+      run: |
+        mkdir -p data/config
+        cat > data/config/config.yaml << EOF
+        # Test configuration
+        bind: 0.0.0.0:1258
+        sources:
+          - type: "ss"
+            url: "https://example.com/ss.txt"
+        database_url: "sqlite3://proxy.db"
+        EOF
+
+    - name: Test with Docker Compose
+      run: |
+        # 创建 docker-compose.test.yml
+        cat > docker-compose.test.yml << EOF
+        version: '3.3'
+        services:
+          ssrlive-proxypool:
+            build: ./proxypool
+            container_name: proxypool-test
+            ports:
+              - '1258:1258'
+            volumes:
+              - './data/config:/config'
+            command: '-c /config/config.yaml'
+            healthcheck:
+              test: ["CMD", "curl", "-f", "http://localhost:1258/"]
+              interval: 30s
+              timeout: 10s
+              retries: 3
+        EOF
+        
+        # 运行测试
+        docker-compose -f docker-compose.test.yml up -d
+        sleep 30
+        
+        # 检查服务是否正常运行
+        docker-compose -f docker-compose.test.yml ps
+        
+        # 测试API响应
+        curl -f http://localhost:1258/ || echo "Service test failed"
+        
+        # 清理
+        docker-compose -f docker-compose.test.yml down
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Deploy to staging
+      run: |
+        echo "部署到测试环境"
+        # 这里可以添加部署到测试环境的步骤
+        
+    - name: Create deployment artifacts
+      run: |
+        mkdir -p deployment
+        
+        # 创建生产环境的 docker-compose.yml
+        cat > deployment/docker-compose.yml << 'EOF'
+        version: '3.3'
+        services:
+          ssrlive-proxypool:
+            image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            restart: always
+            container_name: proxypool
+            ports:
+              - '1258:1258'
+            volumes:
+              - './data/config:/config'
+            command: '-c /config/config.yaml'
+            environment:
+              - TZ=Asia/Shanghai
+            logging:
+              driver: "json-file"
+              options:
+                max-size: "10m"
+                max-file: "3"
+        EOF
+        
+        # 创建示例配置文件
+        mkdir -p deployment/data/config
+        cat > deployment/data/config/config.yaml.example << 'EOF'
+        # ProxyPool Configuration
+        bind: 0.0.0.0:1258
+        
+        # 数据库配置
+        database_url: "sqlite3://proxy.db"
+        
+        # 代理源配置
+        sources:
+          - type: "ss"
+            url: "https://example.com/ss.txt"
+          - type: "ssr"
+            url: "https://example.com/ssr.txt"
+          - type: "vmess"
+            url: "https://example.com/vmess.txt"
+        
+        # 健康检查配置
+        health_check:
+          enable: true
+          interval: 300
+          timeout: 5
+          lazy: true
+        
+        # 输出配置
+        output:
+          ss: true
+          ssr: true
+          vmess: true
+          surge: true
+          clash: true
+        EOF
+        
+        # 创建启动脚本
+        cat > deployment/start.sh << 'EOF'
+        #!/bin/bash
+        
+        # 检查配置文件
+        if [ ! -f "./data/config/config.yaml" ]; then
+            echo "配置文件不存在，请复制 config.yaml.example 为 config.yaml 并修改配置"
+            exit 1
+        fi
+        
+        # 启动服务
+        docker-compose up -d
+        
+        echo "ProxyPool 服务已启动"
+        echo "访问地址: http://localhost:1258"
+        EOF
+        
+        chmod +x deployment/start.sh
+        
+        # 创建README
+        cat > deployment/README.md << 'EOF'
+        # ProxyPool 部署
+
+        ## 快速开始
+
+        1. 复制配置文件:
+        ```bash
+        cp data/config/config.yaml.example data/config/config.yaml
+        ```
+
+        2. 修改配置文件 `data/config/config.yaml`
+
+        3. 启动服务:
+        ```bash
+        ./start.sh
+        ```
+
+        ## 服务管理
+
+        启动服务:
+        ```bash
+        docker-compose up -d
+        ```
+
+        停止服务:
+        ```bash
+        docker-compose down
+        ```
+
+        查看日志:
+        ```bash
+        docker-compose logs -f
+        ```
+
+        重启服务:
+        ```bash
+        docker-compose restart
+        ```
+
+        ## 访问地址
+
+        - Web界面: http://localhost:1258
+        - API文档: http://localhost:1258/docs
+
+        ## 配置说明
+
+        详细配置说明请参考 `config.yaml.example` 文件中的注释。
+        EOF
+
+    - name: Upload deployment artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-files
+        path: deployment/
+        retention-days: 30
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
